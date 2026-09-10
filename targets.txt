@@ -1,0 +1,24 @@
+# One target per line. Blank lines and lines starting with # are ignored.
+#
+# Strix can scan:
+#   - a public GitHub repo:  https://github.com/owner/repo
+#   - a local folder:        ./some-folder
+#   - a live website:        https://your-app.com
+#   - an API spec:           ./openapi.yaml   (add the live base URL as a second line)
+#
+# Only list systems you own or have written permission to test.
+
+# --- Your main SaaS project -------------------------------------------------
+https://github.com/VikashMeena777/ChirplyMint-NovaMint
+
+# --- Live production site ---------------------------------------------------
+# Black-box test of the deployed app. This sends real traffic to production,
+# so keep it commented out unless you deliberately want that.
+# https://chirplymint.novamintnetworks.in
+
+# --- Add more projects below ------------------------------------------------
+# https://github.com/VikashMeena777/ClipMint-NovaMint
+# https://github.com/VikashMeena777/ContentMint-NovaMint
+# https://github.com/VikashMeena777/LegalMint-NovaMint
+# https://github.com/VikashMeena777/TradeMint-NovaMint
+# https://github.com/VikashMeena777/ToolzHub

@@ -1,0 +1,12 @@
+# Scan output written by Strix on every run
+strix_runs/
+strix-console.log
+
+# Local environment / secrets — never commit
+.env
+.env.local
+*.env
+
+# Local tooling
+.venv/
+node_modules/
