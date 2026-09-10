@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "strix-platform",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-11-01",
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "strix-platform-db",
+      "database_id": "3eb13620-bae6-4c5d-8307-899698cf034c"
+    }
+  ],
+  "vars": {
+    "GITHUB_REPO": "vkm65569-tech/Strix",
+    "WORKFLOW_FILE": "strix-scan.yml"
+  }
+}

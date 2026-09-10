@@ -1,74 +1,88 @@
 name: Strix Security Scan
 
-# Runs the Strix AI pentest agent headlessly on a GitHub runner.
-# Strix exits with code 2 when it finds vulnerabilities, 0 when clean, 1 on error.
+# Two ways this workflow runs:
+#
+#  1. Platform dispatch — the Strix Platform Cloudflare Worker calls the GitHub
+#     workflow_dispatch API with targets_json. After scanning it POSTs the
+#     report back to the platform, which shows it in the dashboard.
+#  2. Manual dispatch — you run it from the Actions tab and read the artifact.
 
 on:
-  # Run it by hand from the Actions tab. This is the normal way to use it.
   workflow_dispatch:
     inputs:
-      scan_mode:
-        description: "How hard to scan"
-        type: choice
-        options: [quick, standard, deep]
-        default: quick
-      target_mode:
-        description: "What to scan"
-        type: choice
-        options:
-          - targets_file     # scan every repo listed in targets.txt
-          - this_repo        # scan the code in THIS repository
-          - custom_url       # scan a live URL or repo you type below
-        default: targets_file
-      custom_target:
-        description: "Only used when target_mode = custom_url (e.g. https://myapp.com)"
+      targets_json:
+        description: "JSON array of targets: [{\"type\":\"github|web|supabase\",\"label\":\"...\",\"target\":\"https://...\"}]"
         type: string
         required: false
         default: ""
+      scan_mode:
+        description: "quick | standard | deep"
+        type: choice
+        options: [quick, standard, deep]
+        default: quick
       budget:
-        description: "Maximum USD to spend on this single run"
+        description: "Maximum USD to spend on this run"
         type: string
         default: "10"
-  # Weekly safety net. Comment out if you only want manual runs.
-  schedule:
-    - cron: "0 3 * * 1"   # every Monday 03:00 UTC
+      instructions:
+        description: "Extra instructions appended to strix.instructions.md"
+        type: string
+        required: false
+        default: ""
+      callback_url:
+        description: "Platform callback endpoint (set by the platform)"
+        type: string
+        required: false
+        default: ""
+      run_id:
+        description: "Platform run id (set by the platform)"
+        type: string
+        required: false
+        default: ""
+      target_mode:
+        description: "Manual mode only: targets_file | this_repo | custom_url"
+        type: choice
+        options: [targets_file, this_repo, custom_url]
+        default: targets_file
+      custom_target:
+        description: "Manual mode only: one URL or repo to scan"
+        type: string
+        required: false
+        default: ""
 
-# The scan may end with exit code 2 (vulnerabilities found). We handle that
-# ourselves and still want to publish the report artifact.
 permissions:
   contents: read
 
 concurrency:
-  group: strix-${{ github.ref }}
+  group: strix-${{ inputs.run_id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   strix:
     name: Strix pentest
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # deep scans legitimately run for hours; free runners cap at 360 minutes
+    timeout-minutes: 360
 
     env:
-      # Secrets live in: Settings -> Secrets and variables -> Actions
-      # STRIX_LLM is the model string, e.g. openrouter/z-ai/glm-5.3
       STRIX_LLM: ${{ secrets.STRIX_LLM }}
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      # Shared secret between this repo and the platform Worker. The platform
+      # never sends it over the wire; it is set once as a repo secret.
+      PLATFORM_CALLBACK_SECRET: ${{ secrets.PLATFORM_CALLBACK_SECRET }}
       SCAN_MODE: ${{ inputs.scan_mode || 'quick' }}
-      TARGET_MODE: ${{ inputs.target_mode || 'targets_file' }}
-      CUSTOM_TARGET: ${{ inputs.custom_target || '' }}
       BUDGET: ${{ inputs.budget || '10' }}
+      EXTRA_INSTRUCTIONS: ${{ inputs.instructions || '' }}
+      CALLBACK_URL: ${{ inputs.callback_url || '' }}
+      RUN_ID: ${{ inputs.run_id || '' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Strix scopes PR/diff scans by comparing against the base branch,
-          # which needs real history rather than a shallow clone.
           fetch-depth: 0
 
       - name: Free up disk space
-        # The Strix sandbox image is large and ubuntu-latest only has ~14 GB.
-        # Removing preinstalled SDKs that a pentest run does not need.
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
@@ -83,52 +97,95 @@ jobs:
       - name: Check that secrets are configured
         run: |
           missing=0
-          if [ -z "$STRIX_LLM" ]; then
-            echo "::error::Secret STRIX_LLM is not set (e.g. openrouter/z-ai/glm-5.3)"
+          [ -z "$STRIX_LLM" ] && { echo "::error::Secret STRIX_LLM is not set"; missing=1; }
+          [ -z "$LLM_API_KEY" ] && { echo "::error::Secret LLM_API_KEY is not set"; missing=1; }
+          if [ -n "$CALLBACK_URL" ] && [ -z "$PLATFORM_CALLBACK_SECRET" ]; then
+            echo "::error::Platform run needs secret PLATFORM_CALLBACK_SECRET"
             missing=1
           fi
-          if [ -z "$LLM_API_KEY" ]; then
-            echo "::error::Secret LLM_API_KEY is not set"
-            missing=1
-          fi
-          if [ "$missing" = "1" ]; then
-            echo "Add them under Settings -> Secrets and variables -> Actions -> New repository secret."
-            exit 1
-          fi
-          echo "Both secrets are present. Model: $STRIX_LLM"
+          [ "$missing" = "1" ] && exit 1
+          echo "Secrets present. Model: $STRIX_LLM"
 
       - name: Install Strix
         run: |
           curl -sSL https://strix.ai/install | bash
-          # The installer exports the CLI location for GitHub runners itself.
           strix --version
 
       - name: Pull the Strix sandbox image
         run: docker pull ghcr.io/usestrix/strix-sandbox:1.3.0
 
-      - name: Build the target list
+      - name: Build the target list and instructions
         id: targets
         run: |
-          case "$TARGET_MODE" in
-            this_repo)
-              echo "args=-t ./" >> "$GITHUB_OUTPUT"
-              ;;
-            custom_url)
-              if [ -z "$CUSTOM_TARGET" ]; then
-                echo "::error::target_mode=custom_url but custom_target was empty."
-                exit 1
-              fi
-              echo "args=-t $CUSTOM_TARGET" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              if [ ! -s targets.txt ]; then
-                echo "::error::targets.txt is missing or empty."
-                exit 1
-              fi
-              echo "args=--target-list ./targets.txt" >> "$GITHUB_OUTPUT"
-              ;;
-          esac
-          echo "Scan arguments: $(grep '^args=' "$GITHUB_OUTPUT" | cut -d= -f2-)"
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          targets_json = os.environ.get("TARGETS_JSON", "").strip()
+          target_mode = os.environ.get("TARGET_MODE", "targets_file")
+          custom_target = os.environ.get("CUSTOM_TARGET", "").strip()
+
+          lines = []
+          if targets_json:
+              # Platform mode: the payload is a JSON array of target objects.
+              targets = json.loads(targets_json)
+              seen = set()
+              for t in targets:
+                  tgt = str(t.get("target", "")).strip()
+                  if not tgt or tgt in seen:
+                      continue
+                  seen.add(tgt)
+                  lines.append(tgt)
+                  extra = t.get("extra_targets") or []
+                  lines.extend(str(e).strip() for e in extra if str(e).strip())
+              pathlib.Path("platform-targets.txt").write_text("\n".join(lines) + "\n")
+              print(f"platform targets: {len(lines)} line(s)")
+          elif target_mode == "this_repo":
+              lines = ["./"]
+          elif target_mode == "custom_url":
+              if not custom_target:
+                  raise SystemExit("target_mode=custom_url but custom_target empty")
+              lines = [custom_target]
+          else:
+              if not pathlib.Path("targets.txt").exists() or not pathlib.Path("targets.txt").read_text().strip():
+                  raise SystemExit("targets.txt is missing or empty")
+              lines = ["@targets.txt"]
+
+          print("targets:")
+          for l in lines:
+              print(f"  {l}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              if lines == ["@targets.txt"]:
+                  out.write("args=--target-list ./targets.txt\n")
+              else:
+                  arg = " ".join(f"-t {l}" for l in lines)
+                  out.write(f"args={arg}\n")
+          PY
+        env:
+          TARGETS_JSON: ${{ inputs.targets_json || '' }}
+          TARGET_MODE: ${{ inputs.target_mode || 'targets_file' }}
+          CUSTOM_TARGET: ${{ inputs.custom_target || '' }}
+
+      - name: Write combined instruction file
+        run: |
+          {
+            cat strix.instructions.md 2>/dev/null || echo "# Scan instructions"
+            echo ""
+            if [ -n "$EXTRA_INSTRUCTIONS" ]; then
+              echo "## Instructions from the platform run"
+              echo ""
+              echo "$EXTRA_INSTRUCTIONS"
+              echo ""
+            fi
+            cat <<'EOF'
+          ## Reporting output rules
+
+          - Set the finding `title` to a plain-language sentence a non-engineer owner can act on.
+          - Fill `remediation_steps` with concrete, ordered fixes.
+          - Fill `endpoint` and `method` for API findings.
+          EOF
+          } > combined-instructions.md
+          echo "Combined instruction file written."
 
       - name: Run Strix
         id: scan
@@ -137,21 +194,95 @@ jobs:
           strix -n \
             ${{ steps.targets.outputs.args }} \
             --scan-mode "$SCAN_MODE" \
-            --instruction-file ./strix.instructions.md \
+            --instruction-file ./combined-instructions.md \
             --max-budget "$BUDGET" \
             2>&1 | tee strix-console.log
           code=${PIPESTATUS[0]}
           set -e
-
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          case "$code" in
-            0) echo "::notice::Strix finished and found no confirmed vulnerabilities." ;;
-            2) echo "::warning::Strix reported vulnerabilities. See the artifact and job summary." ;;
-            *) echo "::error::Strix exited with code $code (fatal error). Check strix-console.log." ;;
-          esac
-          # Do not fail the job here; the summary step decides the final status.
 
-      - name: Publish the report to the job summary
+      - name: Collect the report payload
+        if: always()
+        id: collect
+        run: |
+          python3 - <<'PY'
+          import base64, glob, json, os, pathlib
+
+          run_dirs = [p for p in pathlib.Path("strix_runs").glob("*/run.json")] \
+                     if pathlib.Path("strix_runs").is_dir() else []
+          if run_dirs:
+              run_dir = max(run_dirs, key=lambda p: p.stat().st_mtime).parent
+          else:
+              run_dir = None
+          print(f"run dir: {run_dir}")
+
+          # Text artifacts Strix writes on every save. Base64 so arbitrary
+          # content survives a JSON round trip untouched.
+          wanted = [
+              "run.json",
+              "penetration_test_report.md",
+              "vulnerabilities.json",
+              "vulnerabilities.csv",
+              "coverage.json",
+              "findings.sarif",
+          ]
+          files = {}
+          total = 0
+          MAX_FILE = 400_000      # per file
+          MAX_TOTAL = 2_500_000   # whole payload guard rail
+
+          if run_dir:
+              for name in wanted:
+                  p = run_dir / name
+                  if p.is_file():
+                      raw = p.read_bytes()
+                      if len(raw) > MAX_FILE:
+                          raw = raw[:MAX_FILE]
+                      files[name] = base64.b64encode(raw).decode()
+                      total += len(raw)
+
+              # Per-finding deep dives: vulnerabilities/<id>.md
+              vuln_dir = run_dir / "vulnerabilities"
+              if vuln_dir.is_dir():
+                  for p in sorted(vuln_dir.glob("*.md"))[:60]:
+                      if total > MAX_TOTAL:
+                          break
+                      raw = p.read_bytes()[:MAX_FILE]
+                      files[f"vulnerabilities/{p.name}"] = base64.b64encode(raw).decode()
+                      total += len(raw)
+
+          console = pathlib.Path("strix-console.log")
+          if console.is_file():
+              raw = console.read_bytes()[-300_000:]
+              files["console.log"] = base64.b64encode(raw).decode()
+
+          payload = {
+              "run_id": os.environ.get("RUN_ID", ""),
+              "exit_code": os.environ.get("SCAN_EXIT_CODE", ""),
+              "run_dir": run_dir.name if run_dir else None,
+              "files": files,
+          }
+          pathlib.Path("platform-payload.json").write_text(json.dumps(payload))
+          print(f"payload files: {len(files)}, approx {total // 1024} KiB")
+          PY
+        env:
+          SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit_code }}
+
+      - name: Send the report to the platform
+        if: always() && env.CALLBACK_URL != ''
+        run: |
+          status_code=$(curl -sS -o callback-response.txt -w '%{http_code}' \
+            -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Strix-Token: $PLATFORM_CALLBACK_SECRET" \
+            --data-binary @platform-payload.json) || status_code="curl-failed"
+          echo "callback HTTP status: $status_code"
+          head -c 400 callback-response.txt || true
+          if [ "$status_code" != "200" ]; then
+            echo "::warning::Platform callback failed (status $status_code). The report is still in the artifact."
+          fi
+
+      - name: Publish summary
         if: always()
         run: |
           {
@@ -160,34 +291,18 @@ jobs:
             echo "| Field | Value |"
             echo "| --- | --- |"
             echo "| Scan mode | \`$SCAN_MODE\` |"
-            echo "| Target mode | \`$TARGET_MODE\` |"
-            echo "| Model | \`$STRIX_LLM\` |"
-            echo "| Budget cap | \$$BUDGET |"
             echo "| Exit code | \`${{ steps.scan.outputs.exit_code }}\` |"
+            echo "| Platform run | \`$RUN_ID\` |"
+            echo "| Budget cap | \$$BUDGET |"
             echo ""
-            if [ "${{ steps.scan.outputs.exit_code }}" = "2" ]; then
-              echo "**Vulnerabilities were reported.** Download the \`strix-report\` artifact below for the full findings, proof-of-concepts, and remediation notes."
-            elif [ "${{ steps.scan.outputs.exit_code }}" = "0" ]; then
-              echo "**No confirmed vulnerabilities were reported** in this run."
-            else
-              echo "**The scan did not complete.** See the \`strix-console.log\` in the artifact and the run log above."
-            fi
-            echo ""
-            echo "<details><summary>Tail of the console output</summary>"
-            echo ""
-            echo '```'
-            tail -n 60 strix-console.log 2>/dev/null || echo "(no console log produced)"
-            echo '```'
-            echo ""
-            echo "</details>"
+            echo "Full report: download the \`strix-report\` artifact."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload the report
+      - name: Upload the report artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: strix-report
-          # Strix writes machine-readable results to strix_runs/<run-name>/
           path: |
             strix_runs/
             strix-console.log
@@ -197,5 +312,5 @@ jobs:
       - name: Fail the run if vulnerabilities were found
         if: steps.scan.outputs.exit_code == '2'
         run: |
-          echo "::error::Strix found vulnerabilities. Review the strix-report artifact."
+          echo "::error::Strix found vulnerabilities. Review the report."
           exit 2

@@ -10,3 +10,5 @@ strix-console.log
 # Local tooling
 .venv/
 node_modules/
+.dev.vars
+data.local.md
