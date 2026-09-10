@@ -1,116 +1,106 @@
 # 40-StrixScanner
 
-Runs the [Strix](https://github.com/usestrix/strix) AI pentest agent against your
-projects to get a vulnerability report — the "does my project have loopholes"
-answer, with proof-of-concepts and fixes rather than a static-scan checklist.
+Your own private Strix platform — like a self-hosted strix.ai. A dashboard runs
+on Cloudflare Workers where you register targets (GitHub repos, live websites,
+Vercel deployments, Supabase projects). Click **Run scan** and it dispatches a
+GitHub Actions workflow in this repo; Strix pentests the target on GitHub's
+machines; when it finishes, the report is POSTed back and appears in the
+dashboard with severity counts, findings, and the full write-up.
 
-This folder is standalone. Nothing here is added to ChirplyMint or any other
-project repo.
+**Dashboard:** https://strix-platform.novamint.workers.dev
 
-## What is in here
+## How the pieces fit
 
-| Path | Purpose |
-| --- | --- |
-| `.github/workflows/strix-scan.yml` | The GitHub Actions workflow that runs Strix |
-| `targets.txt` | The list of repos/sites to scan — edit this |
-| `strix.instructions.md` | Priorities and reporting rules given to the AI agent |
-| `RUN-LOCALLY.md` | How to scan on your own PC instead (needs Docker) |
-
-## Setup — do these once
-
-### 1. Create a GitHub repo for this folder
-
-Create an empty repo, for example `StrixScanner`, in your `VikashMeena777`
-account. Do **not** initialise it with a README.
-
-```bash
-cd "C:/Users/Vikash Meena/Desktop/Automations/40-StrixScanner"
-git init -b main
-git add .
-git commit -m "Add Strix security scan workflow"
-git remote add origin https://github.com/VikashMeena777/StrixScanner.git
-git push -u origin main
+```
+ Dashboard (Cloudflare Worker)  ──dispatch──▶  GitHub Action (this repo)
+        ▲                                              │
+        │  POST /api/scan-callback                     ▼  strix -n
+        └────────────── report ◀──────────────  Strix sandbox (Docker)
 ```
 
-### 2. Get an LLM API key
+- `platform/` — the Cloudflare Worker: dashboard UI, REST API, D1 database
+  (`strix-platform-db`), GitHub dispatch, report ingestion.
+- `.github/workflows/strix-scan.yml` — the scan job. Reads its targets from the
+  platform's dispatch, runs Strix headless, collects
+  `vulnerabilities.json` + `penetration_test_report.md` + per-finding docs from
+  `strix_runs/<name>/`, and sends them back.
+- `targets.txt` / `strix.instructions.md` — still used when you run the workflow
+  manually from the Actions tab instead of through the platform.
 
-Strix drives the scan with an LLM, so it needs a paid key. Supported providers:
-OpenAI, Anthropic, OpenRouter, Google Vertex, AWS Bedrock, Azure OpenAI,
-Novita, or a local model.
+## Sign in
 
-**It does not support Groq or NVIDIA NIM**, so the keys in your other `.env`
-files will not work here. The cheapest practical route is OpenRouter, which gives
-one key access to many models:
+The dashboard asks for the **dashboard token**. Its current value is stored in
+`platform/.dev.vars` as `DASHBOARD_TOKEN=` (that file is gitignored and never
+committed). Change it any time:
 
-- Sign up at https://openrouter.ai, add ~$10 credit, create a key.
+```bash
+cd platform
+printf 'new-token-here' | npx wrangler secret put DASHBOARD_TOKEN
+```
 
-### 3. Add two repo secrets
+## Secrets — where everything lives
 
-In the new repo: **Settings → Secrets and variables → Actions → New repository secret**.
+| Secret | Where | What it is |
+| --- | --- | --- |
+| `STRIX_LLM` | GitHub repo secrets | Model string, e.g. `openrouter/z-ai/glm-5.3` |
+| `LLM_API_KEY` | GitHub repo secrets | Paid LLM key (OpenAI / Anthropic / OpenRouter / Vertex / Bedrock / Azure / Novita) |
+| `PLATFORM_CALLBACK_SECRET` | GitHub repo secrets | Shared secret the Action sends reports with |
+| `GITHUB_TOKEN` | Worker secrets | Token with `workflow` scope, used to dispatch runs |
+| `DASHBOARD_TOKEN` | Worker secrets | Your dashboard login |
+| `CALLBACK_SECRET` | Worker secrets | Must match `PLATFORM_CALLBACK_SECRET` |
 
-| Secret name | Value |
-| --- | --- |
-| `STRIX_LLM` | `openrouter/z-ai/glm-5.3` (the recommended default) |
-| `LLM_API_KEY` | your OpenRouter API key |
+**Not set yet:** `STRIX_LLM` and `LLM_API_KEY` on the GitHub repo. Until those
+exist, every scan fails fast at the secrets check by design — that is the only
+remaining setup step.
 
-The names must match exactly. The workflow checks for them and tells you clearly
-if either is missing.
+## Using it
 
-### 4. Pick what to scan
+1. Open the dashboard and sign in with the dashboard token.
+2. **New target** — pick a type, give it a label, paste the URL:
+   - *GitHub repository* — scans the source code (`https://github.com/owner/repo`).
+   - *Website / Vercel deployment* — black-box test of the live site.
+   - *Supabase project API* — black-box test of the project's REST endpoint
+     (RLS gaps, auth flows). Paste the project URL; add anything else (e.g. an
+     OpenAPI spec URL) under extra targets.
+   - *Vercel project* — same as website; paste the production domain.
+   - Extra targets and per-target agent instructions are optional.
+3. **Run a scan** — tick targets, pick depth (`quick` / `standard` / `deep`),
+   set a spend cap, click Run. The run appears as `running` immediately.
+4. When the Action finishes (minutes to hours depending on depth), the run
+   flips to `complete` and shows: exit code, findings grouped by severity
+   (Critical → Info), each finding's impact / PoC / remediation, the agent's
+   per-finding deep dives, and the full markdown report.
+5. A run stuck on `running` can be reconciled with **Sync from GitHub**.
 
-Edit `targets.txt`. It currently scans `ChirplyMint-NovaMint`'s GitHub repo.
-Add other projects by uncommenting lines.
+The run also leaves a `strix-report` artifact on the GitHub run page as a
+backup of the raw report files.
 
-## Running a scan
+## Costs
 
-Go to the repo's **Actions** tab → **Strix Security Scan** → **Run workflow**.
-You get four choices:
+- Strix itself is free and runs on GitHub's free `ubuntu-latest` runner.
+- The LLM key pays per token — the run's `budget` input is a hard USD cap per
+  run. `quick` is the cheap default; `deep` on a big app can burn real money,
+  so always keep a cap.
+- Cloudflare: Workers free plan + one D1 database — effectively $0 at this scale.
 
-- **scan_mode** — `quick` (minutes, only the changed files on a PR), `standard`
-  (~30 min), or `deep` (1–4 hours, for a release).
-- **target_mode** — `targets_file` (scan everything in `targets.txt`),
-  `this_repo` (scan the scanner repo itself), or `custom_url` (scan one URL or
-  repo you type in).
-- **custom_target** — only used with `custom_url`.
-- **budget** — a hard USD cap for that single run. The default `10` means the run
-  stops at $10 of model usage no matter what.
+## Deploying changes to the platform
 
-A weekly scan also runs automatically every Monday at 03:00 UTC. Delete the
-`schedule:` block in the workflow if you only want manual runs.
+```bash
+cd platform
+npm install        # once
+npx wrangler d1 execute strix-platform-db --remote --file=schema.sql   # schema changes only
+npx wrangler deploy
+```
 
-## Reading the result
+Committing to this repo does **not** redeploy the Worker automatically — run
+`npx wrangler deploy` after editing `platform/src/`. The GitHub workflow, by
+contrast, takes effect from the repo immediately.
 
-Two places, both filled in after every run:
+## Non-negotiable rules
 
-1. **The job summary** — open the finished run and you get a table plus the tail
-   of the console output, at a glance.
-2. **The `strix-report` artifact** — the full findings. Download it from the
-   bottom of the run page. It contains `strix_runs/<run-name>/` with the report
-   and the raw console log.
-
-A run turns **red** when Strix found vulnerabilities (exit code 2), **green**
-when it found none. That is deliberate: red means "read the report", not
-"something broke". A genuine tool failure also shows red but with a different
-message in the log.
-
-## Cost and time expectations
-
-- A `quick` scan is the cheap default and is usually enough for a first look or a
-  PR check.
-- `standard` and `deep` scan much more aggressively and cost correspondingly
-  more. Always set a `budget` for those.
-- Each run downloads the Strix sandbox Docker image (~a few GB). The workflow
-  frees disk space on the runner first because the image is large.
-
-## Important caveats
-
-- **Only scan systems you own or have written permission to test.** Strix
-  actively sends attack traffic. This covers your own projects and deployed
-  sites; it does not cover anyone else's.
-- **Scanning a live URL hits production.** The `https://chirplymint...` line in
-  `targets.txt` is commented out for that reason. Uncomment it only when you
-  deliberately want a black-box test against the running app — it will create
-  test data and could trigger rate limits.
-- **The report is a starting point, not a verdict.** An AI pentester can miss
-  things and can be wrong. Treat every finding as a lead to verify.
-- **Never commit an API key into this repo.** Keys belong in Actions secrets.
+- **Only scan systems you own or have written permission to test.** Strix sends
+  real attack traffic.
+- **Live-target scans hit production.** Testing a deployed app creates test
+  data, can trip rate limits, and can trigger alerts. Use `quick` first.
+- **The report is a lead list, not a verdict.** Validate findings before acting,
+  and treat "no findings" as "nothing found this pass", not "secure".

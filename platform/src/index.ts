@@ -48,7 +48,7 @@ export default {
       if (request.method === 'GET' && path === '/api/ping') {
         return json({ ok: true });
       }
-      if (!safeEqual(request.headers.get('authorization') ?? '', `Bearer ${env.DASHBOARD_TOKEN}`)) {
+      if (!(await safeEqual(request.headers.get('authorization') ?? '', `Bearer ${env.DASHBOARD_TOKEN}`))) {
         return errorResponse(401, 'Invalid or missing dashboard token.');
       }
       return handleApi(request, env);
@@ -61,7 +61,7 @@ export default {
 /** Ingest a finished scan: decode the artifacts and persist them. */
 async function handleCallback(request: Request, env: Env): Promise<Response> {
   const provided = request.headers.get('x-strix-token') ?? '';
-  if (!provided || !safeEqual(provided, env.CALLBACK_SECRET)) {
+  if (!provided || !(await safeEqual(provided, env.CALLBACK_SECRET))) {
     return errorResponse(401, 'Invalid callback token.');
   }
 
@@ -111,6 +111,9 @@ async function handleCallback(request: Request, env: Env): Promise<Response> {
   const exitCode = Number.parseInt(body.exit_code ?? '', 10);
   const status = Number.isFinite(exitCode) && (exitCode === 0 || exitCode === 2) ? 'complete' : 'error';
   const now = new Date().toISOString();
+  const errorMessage = Number.isFinite(exitCode)
+    ? `Scan exited with code ${exitCode}. See the strix-report artifact on GitHub.`
+    : 'The workflow failed before the scan step ran. Check the run log on GitHub (most often a missing STRIX_LLM / LLM_API_KEY secret).';
 
   await env.DB.prepare(
     `UPDATE runs SET
@@ -130,7 +133,7 @@ async function handleCallback(request: Request, env: Env): Promise<Response> {
       runRecordRaw,
       coverageRaw,
       JSON.stringify(rest).slice(0, 4_000_000),
-      status === 'error' ? `Scan exited with code ${body.exit_code}. See the strix-report artifact on GitHub.` : null,
+      status === 'error' ? errorMessage : null,
       now,
     )
     .run();
