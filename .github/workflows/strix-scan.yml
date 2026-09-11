@@ -395,20 +395,24 @@ jobs:
 
       - name: Save progress for the next attempt
         if: always() && steps.scan.outputs.timed_out == 'true'
+        id: save_progress
         run: |
           set -e
-          members=()
-          [ -d strix_runs ] && members+=(strix_runs)
-          [ -d /tmp/strix_repos ] && members+=(-C / tmp/strix_repos)
-          if [ ${#members[@]} -eq 0 ]; then
-            echo "::warning::Nothing to hand off — no run state was created."
-            exit 0
+          # Real state = a run directory with run.json (Strix writes it as soon
+          # as the scan starts). An empty strix_runs/ folder is not state.
+          if ! ls strix_runs/*/run.json >/dev/null 2>&1; then
+            echo "has_state=false" >> "$GITHUB_OUTPUT"
+            echo "::error::The time budget expired before Strix created any run state (startup + clone consumed the whole window). Nothing to resume — rerun with a larger window."
+            exit 1
           fi
+          echo "has_state=true" >> "$GITHUB_OUTPUT"
+          members=(strix_runs)
+          [ -d /tmp/strix_repos ] && members+=(-C / tmp/strix_repos)
           tar -czf strix-progress.tar.gz -C "$GITHUB_WORKSPACE" "${members[@]}"
           ls -lh strix-progress.tar.gz
 
       - name: Upload handoff artifact
-        if: always() && steps.scan.outputs.timed_out == 'true'
+        if: always() && steps.save_progress.outputs.has_state == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: strix-progress
@@ -418,7 +422,7 @@ jobs:
 
       - name: Dispatch the next attempt
         id: chain
-        if: always() && steps.scan.outputs.timed_out == 'true' && env.CHAIN_ATTEMPT < env.MAX_ATTEMPTS
+        if: always() && steps.save_progress.outputs.has_state == 'true' && steps.scan.outputs.timed_out == 'true' && env.CHAIN_ATTEMPT < env.MAX_ATTEMPTS
         run: |
           set -e
           next_attempt=$((CHAIN_ATTEMPT + 1))
@@ -484,9 +488,13 @@ jobs:
       - name: Tell the platform the scan is continuing
         if: always() && env.CALLBACK_URL != '' && steps.scan.outputs.timed_out == 'true'
         run: |
-          if [ "$CHAIN_ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
-            note="Attempt $CHAIN_ATTEMPT/$MAX_ATTEMPTS hit the time limit and the attempt cap is reached - scan incomplete. Increase max_attempts or split the target."
-            payload=$(jq -n --arg run_id "$RUN_ID" --arg phase "gave_up" --arg note "$note" \
+          if [ "${{ steps.save_progress.outputs.has_state }}" != "true" ]; then
+            payload=$(jq -n --arg run_id "$RUN_ID" --arg phase "gave_up" \
+              --arg note "Attempt $CHAIN_ATTEMPT/$MAX_ATTEMPTS hit the time limit before any scan state was created (startup consumed the window). Rerun with a larger window." \
+              '{run_id: $run_id, phase: $phase, note: $note}')
+          elif [ "$CHAIN_ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+            payload=$(jq -n --arg run_id "$RUN_ID" --arg phase "gave_up" \
+              --arg note "Attempt $CHAIN_ATTEMPT/$MAX_ATTEMPTS hit the time limit and the attempt cap is reached - scan incomplete. Increase max_attempts or split the target." \
               '{run_id: $run_id, phase: $phase, note: $note}')
           else
             note="Attempt $CHAIN_ATTEMPT/$MAX_ATTEMPTS hit the time limit; continuing in attempt $((CHAIN_ATTEMPT + 1))."
