@@ -12,3 +12,5 @@ strix-console.log
 node_modules/
 .dev.vars
 data.local.md
+.tmp/
+.tmp-verify/
