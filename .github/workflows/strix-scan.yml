@@ -556,6 +556,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Flag fatal scan errors
+        if: always() && steps.scan.outputs.timed_out == 'false' && steps.scan.outputs.exit_code != '0' && steps.scan.outputs.exit_code != '2'
+        run: |
+          echo "::error::Strix exited with code ${{ steps.scan.outputs.exit_code }} (fatal — see the Run Strix log above; most often an LLM connection/auth problem)."
+          exit 1
+
       - name: Flag findings (optional gate)
         if: always() && steps.scan.outputs.exit_code == '2' && inputs.fail_on_findings == 'true'
         run: |
