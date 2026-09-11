@@ -109,6 +109,9 @@ jobs:
       - name: Install Strix
         run: |
           curl -sSL https://strix.ai/install | bash
+          # The installer appends ~/.strix/bin to $GITHUB_PATH, which only
+          # applies to LATER steps — export it here for this step's own use.
+          export PATH="$HOME/.strix/bin:$PATH"
           strix --version
 
       - name: Pull the Strix sandbox image
