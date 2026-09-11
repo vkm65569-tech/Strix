@@ -43,15 +43,37 @@ printf 'new-token-here' | npx wrangler secret put DASHBOARD_TOKEN
 | Secret | Where | What it is |
 | --- | --- | --- |
 | `STRIX_LLM` | GitHub repo secrets | Model string, e.g. `openrouter/z-ai/glm-5.3` |
-| `LLM_API_KEY` | GitHub repo secrets | Paid LLM key (OpenAI / Anthropic / OpenRouter / Vertex / Bedrock / Azure / Novita) |
+| `LLM_API_KEY` | GitHub repo secrets | The provider API key matching `STRIX_LLM` |
 | `PLATFORM_CALLBACK_SECRET` | GitHub repo secrets | Shared secret the Action sends reports with |
 | `GITHUB_TOKEN` | Worker secrets | Token with `workflow` scope, used to dispatch runs |
 | `DASHBOARD_TOKEN` | Worker secrets | Your dashboard login |
 | `CALLBACK_SECRET` | Worker secrets | Must match `PLATFORM_CALLBACK_SECRET` |
 
-**Not set yet:** `STRIX_LLM` and `LLM_API_KEY` on the GitHub repo. Until those
-exist, every scan fails fast at the secrets check by design — that is the only
-remaining setup step.
+**Currently set:** `STRIX_LLM` = `nvidia_nim/deepseek-ai/deepseek-v4-flash-0731`
+with your existing NVIDIA NIM key. Everything is wired; scans can run now.
+
+## LLM providers (verified 2026-09-11)
+
+Strix routes any model string through LiteLLM, so providers beyond the
+documented list work — Strix copies `LLM_API_KEY` into the env var the provider
+expects. Tested against live APIs with your keys:
+
+| `STRIX_LLM` value | Verdict |
+| --- | --- |
+| `nvidia_nim/deepseek-ai/deepseek-v4-flash-0731` | ✅ **active** — fast (sub-second), solid tool calling |
+| `nvidia_nim/nvidia/nemotron-3-super-120b-a12b` | ✅ good alternate — agent-tuned, ~1s responses |
+| `nvidia_nim/moonshotai/kimi-k3` | ⛔ avoid — endpoint queued >5 min, unusable for agent loops |
+| `groq/openai/gpt-oss-120b` | ⚠️ works, but your Groq key is free tier (8k tokens/min) — every agent turn exceeds that, so scans crawl on rate limits. Only viable on a paid Groq tier |
+
+To switch provider: update the two repo secrets `STRIX_LLM` and `LLM_API_KEY`
+(Settings → Secrets and variables → Actions) — no code changes needed.
+
+**NIM credit caveat:** build.nvidia.com keys work on a request-credit balance.
+A scan makes hundreds of LLM calls; if the balance runs out mid-scan the run
+fails. Also note Strix's USD budget cap estimates $0 for NIM models (unknown
+pricing), so the cap will not trigger — the credit balance is the real limit.
+
+## Costs
 
 ## Using it
 
@@ -78,9 +100,11 @@ backup of the raw report files.
 ## Costs
 
 - Strix itself is free and runs on GitHub's free `ubuntu-latest` runner.
-- The LLM key pays per token — the run's `budget` input is a hard USD cap per
-  run. `quick` is the cheap default; `deep` on a big app can burn real money,
-  so always keep a cap.
+- LLM cost depends on the provider: metered keys (OpenRouter, OpenAI, …) pay
+  per token and respect the run's USD `budget` cap; credit-based keys (NVIDIA
+  NIM) burn one credit per request instead — see the caveat above.
+- `quick` is the cheap default; `deep` on a big app can burn real money or the
+  whole credit balance, so start with `quick`.
 - Cloudflare: Workers free plan + one D1 database — effectively $0 at this scale.
 
 ## Deploying changes to the platform
