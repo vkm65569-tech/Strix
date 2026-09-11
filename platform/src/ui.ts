@@ -430,6 +430,7 @@ export function dashboardHtml(): string {
             '<span class="pill ' + esc(r.status) + '">' + esc(r.status) + '</span>' +
             '<span class="tiny muted" style="flex:1;">' + esc(when) + ' · ' + esc(r.scan_mode) + ' · cap $' + esc(r.budget) + '</span></div>' +
             '<div class="tiny" style="margin-top:4px;color:var(--muted);">' + esc(targets) + '</div>' +
+            (r.progress ? '<div class="tiny" style="margin-top:4px;color:var(--blue);">' + esc(r.progress) + '</div>' : '') +
             (r.error ? '<div class="tiny" style="margin-top:4px;color:#f1b0b0;">' + esc(r.error) + '</div>' : '') +
             '</div>';
         }).join('');
@@ -485,6 +486,7 @@ export function dashboardHtml(): string {
         (counts && Object.keys(counts).length ? sevHtml : '') +
         '</div>' +
         '<div class="field"><div class="k">Targets</div><div class="v">' + esc(targets) + '</div></div>' +
+        (r.progress ? '<div class="field"><div class="k">Progress</div><div class="v" style="color:var(--blue);">' + esc(r.progress) + '</div></div>' : '') +
         (r.gh_run_url ? '<div class="field"><div class="k">GitHub run</div><div class="v"><a href="' + esc(r.gh_run_url) + '" target="_blank" rel="noopener noreferrer">open workflow run</a></div></div>' : '');
 
       byId('rdError').innerHTML = r.error ? '<div class="err">' + esc(r.error) + '</div>' : '';

@@ -6,6 +6,12 @@ name: Strix Security Scan
 #     workflow_dispatch API with targets_json. After scanning it POSTs the
 #     report back to the platform, which shows it in the dashboard.
 #  2. Manual dispatch — you run it from the Actions tab and read the artifact.
+#
+# GitHub jobs hard-stop at 6 hours. Long scans survive that via a chain:
+# each attempt gives Strix a time budget (6h minus overhead), and if the scan
+# is still going when it expires, the run state + cloned repos are saved to an
+# artifact and a fresh workflow run is dispatched with --resume to continue
+# where it left off, up to max_attempts attempts.
 
 on:
   workflow_dispatch:
@@ -21,7 +27,7 @@ on:
         options: [quick, standard, deep]
         default: quick
       budget:
-        description: "Maximum USD to spend on this run"
+        description: "Maximum USD to spend per attempt"
         type: string
         default: "10"
       instructions:
@@ -49,9 +55,31 @@ on:
         type: string
         required: false
         default: ""
+      fail_on_findings:
+        description: "Exit red when vulnerabilities are found (default: green, report in dashboard)"
+        type: string
+        default: "false"
+      chain_attempt:
+        description: "Chain bookkeeping: which attempt this run is (1 = fresh)"
+        type: string
+        default: "1"
+      max_attempts:
+        description: "Chain bookkeeping: maximum attempts before giving up"
+        type: string
+        default: "4"
+      previous_run_id:
+        description: "Chain bookkeeping: run id of the previous attempt (artifact source)"
+        type: string
+        default: ""
+      scan_window_minutes:
+        description: "Override the auto scan window (debug/testing only, e.g. 3)"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
+  actions: write   # lets the job dispatch its own continuation
 
 concurrency:
   group: strix-${{ inputs.run_id || github.run_id }}
@@ -59,28 +87,36 @@ concurrency:
 
 jobs:
   strix:
-    name: Strix pentest
+    name: Strix pentest (attempt ${{ inputs.chain_attempt || '1' }}/${{ inputs.max_attempts || '4' }})
     runs-on: ubuntu-latest
-    # deep scans legitimately run for hours; free runners cap at 360 minutes
-    timeout-minutes: 360
+    # The runner kills jobs at 360 min; stop ourselves a little earlier.
+    timeout-minutes: 358
 
     env:
       STRIX_LLM: ${{ secrets.STRIX_LLM }}
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      # Shared secret between this repo and the platform Worker. The platform
-      # never sends it over the wire; it is set once as a repo secret.
       PLATFORM_CALLBACK_SECRET: ${{ secrets.PLATFORM_CALLBACK_SECRET }}
       SCAN_MODE: ${{ inputs.scan_mode || 'quick' }}
       BUDGET: ${{ inputs.budget || '10' }}
       EXTRA_INSTRUCTIONS: ${{ inputs.instructions || '' }}
       CALLBACK_URL: ${{ inputs.callback_url || '' }}
       RUN_ID: ${{ inputs.run_id || '' }}
+      CHAIN_ATTEMPT: ${{ inputs.chain_attempt || '1' }}
+      MAX_ATTEMPTS: ${{ inputs.max_attempts || '4' }}
+      PREVIOUS_RUN_ID: ${{ inputs.previous_run_id || '' }}
+      SCAN_WINDOW_OVERRIDE: ${{ inputs.scan_window_minutes || '' }}
+      # Strix clones repo targets to tempfile.gettempdir()/strix_repos —
+      # pin it so the chain restores the clone to the exact same path.
+      TMPDIR: /tmp
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Record job start
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Free up disk space
         run: |
@@ -117,8 +153,38 @@ jobs:
       - name: Pull the Strix sandbox image
         run: docker pull ghcr.io/usestrix/strix-sandbox:1.3.0
 
-      - name: Build the target list and instructions
+      - name: Restore previous attempt state
+        if: env.PREVIOUS_RUN_ID != ''
+        run: |
+          set -e
+          mkdir -p strix_runs
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if gh run download "$PREVIOUS_RUN_ID" -R "$GITHUB_REPOSITORY" \
+                 --name strix-progress --dir handoff 2>/dev/null; then
+              break
+            fi
+            echo "artifact not ready yet (try $i), waiting 30s…"
+            sleep 30
+          done
+          ls -la handoff/ || true
+          if [ -f handoff/strix-progress.tar.gz ]; then
+            tar -xzf handoff/strix-progress.tar.gz -C "$GITHUB_WORKSPACE" strix_runs || true
+            tar -xzf handoff/strix-progress.tar.gz -C / tmp/strix_repos || true
+          fi
+          if ls strix_runs/*/run.json >/dev/null 2>&1; then
+            latest=$(ls -t strix_runs/*/run.json | head -1)
+            name=$(basename "$(dirname "$latest")")
+            echo "RESUME_NAME=$name" >> "$GITHUB_ENV"
+            echo "Resuming run: $name"
+          else
+            echo "::warning::No resumable state found in the handoff — starting a fresh scan."
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Build the target list
         id: targets
+        if: env.RESUME_NAME == ''
         run: |
           python3 - <<'PY'
           import json, os, pathlib
@@ -170,6 +236,7 @@ jobs:
           CUSTOM_TARGET: ${{ inputs.custom_target || '' }}
 
       - name: Write combined instruction file
+        if: env.RESUME_NAME == ''
         run: |
           {
             cat strix.instructions.md 2>/dev/null || echo "# Scan instructions"
@@ -190,26 +257,65 @@ jobs:
           } > combined-instructions.md
           echo "Combined instruction file written."
 
+      - name: Compute the scan time budget
+        id: window
+        run: |
+          python3 - <<'PY'
+          import os, time
+
+          JOB_LIMIT_S = 358 * 60          # matches timeout-minutes
+          SAFETY_MARGIN_S = 15 * 60       # tar + upload + callback + dispatch
+          MIN_WINDOW_S = 20 * 60
+          elapsed = int(time.time()) - int(os.environ["JOB_START"])
+
+          override = os.environ.get("SCAN_WINDOW_OVERRIDE", "").strip()
+          if override:
+              window_s = int(float(override) * 60)
+              print(f"scan window: {window_s}s (override)")
+          else:
+              window_s = JOB_LIMIT_S - elapsed - SAFETY_MARGIN_S
+              window_s = max(MIN_WINDOW_S, min(window_s, 348 * 60))
+              print(f"elapsed: {elapsed}s, scan window: {window_s}s ({window_s//60} min)")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"seconds={window_s}\n")
+          PY
+
       - name: Run Strix
         id: scan
         run: |
           set +e
-          strix -n \
-            ${{ steps.targets.outputs.args }} \
-            --scan-mode "$SCAN_MODE" \
-            --instruction-file ./combined-instructions.md \
-            --max-budget "$BUDGET" \
-            2>&1 | tee strix-console.log
+          if [ -n "$RESUME_NAME" ]; then
+            timeout --kill-after=120s ${{ steps.window.outputs.seconds }}s \
+              strix -n --resume "$RESUME_NAME" --max-budget "$BUDGET" \
+              2>&1 | tee strix-console.log
+          else
+            timeout --kill-after=120s ${{ steps.window.outputs.seconds }}s \
+              strix -n \
+              ${{ steps.targets.outputs.args }} \
+              --scan-mode "$SCAN_MODE" \
+              --instruction-file ./combined-instructions.md \
+              --max-budget "$BUDGET" \
+              2>&1 | tee strix-console.log
+          fi
           code=${PIPESTATUS[0]}
           set -e
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = "124" ] || [ "$code" = "137" ]; then
+            echo "timed_out=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Scan hit its time budget; state saved for the next attempt."
+          else
+            echo "timed_out=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- completion path (scan finished: exit 0 or 2) ----------
 
       - name: Collect the report payload
-        if: always()
+        if: always() && steps.scan.outputs.timed_out == 'false'
         id: collect
         run: |
           python3 - <<'PY'
-          import base64, glob, json, os, pathlib
+          import base64, json, os, pathlib
 
           run_dirs = [p for p in pathlib.Path("strix_runs").glob("*/run.json")] \
                      if pathlib.Path("strix_runs").is_dir() else []
@@ -272,7 +378,7 @@ jobs:
           SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit_code }}
 
       - name: Send the report to the platform
-        if: always() && env.CALLBACK_URL != ''
+        if: always() && env.CALLBACK_URL != '' && steps.scan.outputs.timed_out == 'false'
         run: |
           status_code=$(curl -sS -o callback-response.txt -w '%{http_code}' \
             -X POST "$CALLBACK_URL" \
@@ -285,6 +391,123 @@ jobs:
             echo "::warning::Platform callback failed (status $status_code). The report is still in the artifact."
           fi
 
+      # ---------- chain path (scan hit its time budget) ----------
+
+      - name: Save progress for the next attempt
+        if: always() && steps.scan.outputs.timed_out == 'true'
+        run: |
+          set -e
+          members=()
+          [ -d strix_runs ] && members+=(strix_runs)
+          [ -d /tmp/strix_repos ] && members+=(-C / tmp/strix_repos)
+          if [ ${#members[@]} -eq 0 ]; then
+            echo "::warning::Nothing to hand off — no run state was created."
+            exit 0
+          fi
+          tar -czf strix-progress.tar.gz -C "$GITHUB_WORKSPACE" "${members[@]}"
+          ls -lh strix-progress.tar.gz
+
+      - name: Upload handoff artifact
+        if: always() && steps.scan.outputs.timed_out == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: strix-progress
+          path: strix-progress.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Dispatch the next attempt
+        id: chain
+        if: always() && steps.scan.outputs.timed_out == 'true' && env.CHAIN_ATTEMPT < env.MAX_ATTEMPTS
+        run: |
+          set -e
+          next_attempt=$((CHAIN_ATTEMPT + 1))
+          body=$(jq -n \
+            --arg ref "main" \
+            --arg targets_json "${TARGETS_JSON:-}" \
+            --arg scan_mode "$SCAN_MODE" \
+            --arg budget "$BUDGET" \
+            --arg instructions "${EXTRA_INSTRUCTIONS:-}" \
+            --arg callback_url "${CALLBACK_URL:-}" \
+            --arg run_id "${RUN_ID:-}" \
+            --arg target_mode "${TARGET_MODE:-targets_file}" \
+            --arg custom_target "${CUSTOM_TARGET:-}" \
+            --arg fail_on_findings "${FAIL_ON_FINDINGS:-false}" \
+            --arg chain_attempt "$next_attempt" \
+            --arg max_attempts "$MAX_ATTEMPTS" \
+            --arg previous_run_id "$GITHUB_RUN_ID" \
+            --arg scan_window_minutes "${SCAN_WINDOW_OVERRIDE:-}" \
+            '{ref: $ref, inputs: {
+              targets_json: $targets_json, scan_mode: $scan_mode, budget: $budget,
+              instructions: $instructions, callback_url: $callback_url, run_id: $run_id,
+              target_mode: $target_mode, custom_target: $custom_target,
+              fail_on_findings: $fail_on_findings, chain_attempt: $chain_attempt,
+              max_attempts: $max_attempts, previous_run_id: $previous_run_id,
+              scan_window_minutes: $scan_window_minutes}}')
+
+          status=$(curl -sS -o dispatch-response.txt -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/strix-scan.yml/dispatches" \
+            -d "$body") || status="curl-failed"
+          echo "dispatch HTTP status: $status"
+          cat dispatch-response.txt || true
+          if [ "$status" != "204" ]; then
+            echo "::error::Failed to dispatch attempt $next_attempt."
+            exit 1
+          fi
+
+          # Find the new run so the dashboard can link to it (best effort).
+          next_run_url=""
+          for i in 1 2 3 4 5; do
+            sleep 4
+            info=$(gh run list -R "$GITHUB_REPOSITORY" --workflow strix-scan.yml \
+                     --event workflow_dispatch --limit 1 --json databaseId,url \
+                     --jq '.[0] | select(.databaseId != '"$GITHUB_RUN_ID"')') || true
+            if [ -n "$info" ]; then
+              next_run_id=$(echo "$info" | jq -r '.databaseId')
+              next_run_url=$(echo "$info" | jq -r '.url')
+              break
+            fi
+          done
+          echo "next_run_id=${next_run_id:-}" >> "$GITHUB_OUTPUT"
+          echo "next_run_url=${next_run_url:-}" >> "$GITHUB_OUTPUT"
+          echo "Attempt $next_attempt dispatched."
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGETS_JSON: ${{ inputs.targets_json || '' }}
+          TARGET_MODE: ${{ inputs.target_mode || 'targets_file' }}
+          CUSTOM_TARGET: ${{ inputs.custom_target || '' }}
+          FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings || 'false' }}
+
+      - name: Tell the platform the scan is continuing
+        if: always() && env.CALLBACK_URL != '' && steps.scan.outputs.timed_out == 'true'
+        run: |
+          if [ "$CHAIN_ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+            note="Attempt $CHAIN_ATTEMPT/$MAX_ATTEMPTS hit the time limit and the attempt cap is reached - scan incomplete. Increase max_attempts or split the target."
+            payload=$(jq -n --arg run_id "$RUN_ID" --arg phase "gave_up" --arg note "$note" \
+              '{run_id: $run_id, phase: $phase, note: $note}')
+          else
+            note="Attempt $CHAIN_ATTEMPT/$MAX_ATTEMPTS hit the time limit; continuing in attempt $((CHAIN_ATTEMPT + 1))."
+            payload=$(jq -n --arg run_id "$RUN_ID" --arg phase "progress" \
+              --arg note "$note" \
+              --argjson attempt "$CHAIN_ATTEMPT" --argjson max_attempts "$MAX_ATTEMPTS" \
+              --arg next_gh_run_id "${{ steps.chain.outputs.next_run_id }}" \
+              --arg next_run_url "${{ steps.chain.outputs.next_run_url }}" \
+              '{run_id: $run_id, phase: $phase, note: $note, attempt: $attempt,
+                max_attempts: $max_attempts, next_gh_run_id: ($next_gh_run_id | tonumber? // null),
+                next_run_url: (if $next_run_url == "" then null else $next_run_url end)}')
+          fi
+          status_code=$(curl -sS -o callback-response.txt -w '%{http_code}' \
+            -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Strix-Token: $PLATFORM_CALLBACK_SECRET" \
+            -d "$payload") || status_code="curl-failed"
+          echo "progress callback HTTP status: $status_code"
+
+      # ---------- shared wrap-up ----------
+
       - name: Publish summary
         if: always()
         run: |
@@ -294,15 +517,28 @@ jobs:
             echo "| Field | Value |"
             echo "| --- | --- |"
             echo "| Scan mode | \`$SCAN_MODE\` |"
+            echo "| Attempt | \`$CHAIN_ATTEMPT / $MAX_ATTEMPTS\` |"
             echo "| Exit code | \`${{ steps.scan.outputs.exit_code }}\` |"
             echo "| Platform run | \`$RUN_ID\` |"
-            echo "| Budget cap | \$$BUDGET |"
+            echo "| Budget cap (per attempt) | \$$BUDGET |"
             echo ""
-            echo "Full report: download the \`strix-report\` artifact."
+            if [ "${{ steps.scan.outputs.timed_out }}" = "true" ]; then
+              if [ "$CHAIN_ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+                echo "**Time limit reached — progress saved and the scan continues in the next run.**"
+              else
+                echo "**Attempt cap reached — the scan did not finish.** See the \`strix-progress\` artifact for the partial state."
+              fi
+            elif [ "${{ steps.scan.outputs.exit_code }}" = "2" ]; then
+              echo "**Vulnerabilities were reported.** Open the platform dashboard or download the \`strix-report\` artifact."
+            elif [ "${{ steps.scan.outputs.exit_code }}" = "0" ]; then
+              echo "**No confirmed vulnerabilities were reported** in this run."
+            else
+              echo "**The scan did not complete.** See the run log above and the \`strix-report\` artifact."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the report artifact
-        if: always()
+        if: always() && steps.scan.outputs.timed_out == 'false'
         uses: actions/upload-artifact@v4
         with:
           name: strix-report
@@ -312,8 +548,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Fail the run if vulnerabilities were found
-        if: steps.scan.outputs.exit_code == '2'
+      - name: Flag findings (optional gate)
+        if: always() && steps.scan.outputs.exit_code == '2' && inputs.fail_on_findings == 'true'
         run: |
-          echo "::error::Strix found vulnerabilities. Review the report."
+          echo "::error::Strix found vulnerabilities (gate enabled via fail_on_findings)."
           exit 2

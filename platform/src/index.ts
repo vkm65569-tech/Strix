@@ -70,6 +70,10 @@ async function handleCallback(request: Request, env: Env): Promise<Response> {
     exit_code?: string;
     run_dir?: string | null;
     files?: Record<string, string>;
+    phase?: string;
+    note?: string;
+    next_gh_run_id?: number | string | null;
+    next_run_url?: string | null;
   };
   try {
     body = await request.json();
@@ -80,6 +84,33 @@ async function handleCallback(request: Request, env: Env): Promise<Response> {
   const runId = (body.run_id ?? '').trim();
   if (!runId) return errorResponse(400, 'run_id is required.');
 
+  // ---- continuation callbacks from a scan that hit its time budget ----
+  // "progress": the scan continues in a fresh GitHub run; keep the platform
+  //            run alive and point the dashboard link at the new attempt.
+  // "gave_up": the attempt cap was reached; the scan never finished.
+  const phase = (body.phase ?? '').trim();
+  if (phase === 'progress' || phase === 'gave_up') {
+    const note = (body.note ?? '').slice(0, 1000) || null;
+    const nextRunId = Number(body.next_gh_run_id);
+    const nextRunUrl = typeof body.next_run_url === 'string' ? body.next_run_url : null;
+    const now = new Date().toISOString();
+
+    if (phase === 'gave_up') {
+      await env.DB.prepare('UPDATE runs SET status = ?2, error = ?3, progress = ?4, updated_at = ?5 WHERE id = ?1')
+        .bind(runId, 'error', note, note, now)
+        .run();
+      return json({ ok: true, run_id: runId, status: 'error' });
+    }
+
+    await env.DB.prepare(
+      'UPDATE runs SET gh_run_id = COALESCE(?2, gh_run_id), gh_run_url = COALESCE(?3, gh_run_url), progress = ?4, updated_at = ?5 WHERE id = ?1',
+    )
+      .bind(runId, Number.isFinite(nextRunId) ? nextRunId : null, nextRunUrl, note, now)
+      .run();
+    return json({ ok: true, run_id: runId, status: 'running' });
+  }
+
+  // ---- final report callback ----
   const files = body.files ?? {};
   const b64decode = (name: string): string | null => {
     const value = files[name];
@@ -120,7 +151,7 @@ async function handleCallback(request: Request, env: Env): Promise<Response> {
        status = ?2, exit_code = ?3, run_dir = ?4,
        findings_json = ?5, report_md = ?6, run_record_json = ?7,
        coverage_json = ?8, payload_json = ?9,
-       error = ?10, updated_at = ?11, finished_at = ?11
+       error = ?10, progress = NULL, updated_at = ?11, finished_at = ?11
      WHERE id = ?1`,
   )
     .bind(

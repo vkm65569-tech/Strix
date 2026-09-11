@@ -62,7 +62,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     if (method === 'GET' && path === '/api/runs') {
       const { results } = await env.DB.prepare(
         `SELECT id, status, scan_mode, budget, targets_json, gh_run_id, gh_run_url,
-                exit_code, run_dir, error, created_at, updated_at, finished_at
+                exit_code, run_dir, error, progress, created_at, updated_at, finished_at
          FROM runs ORDER BY created_at DESC LIMIT 100`,
       ).all();
       return json({ runs: results });
@@ -72,7 +72,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     if (method === 'GET' && runDetail) {
       const run = await env.DB.prepare(
         `SELECT id, status, scan_mode, budget, targets_json, gh_run_id, gh_run_url, exit_code,
-                run_dir, findings_json, report_md, run_record_json, coverage_json, error,
+                run_dir, findings_json, report_md, run_record_json, coverage_json, error, progress,
                 created_at, updated_at, finished_at
          FROM runs WHERE id = ?1`,
       )

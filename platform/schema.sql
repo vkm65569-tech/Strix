@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS runs (
   run_record_json TEXT,                    -- run.json contents
   coverage_json   TEXT,                    -- coverage.json contents
   payload_json    TEXT,                    -- remaining collected files (csv, sarif, console log)
+  progress        TEXT,                    -- continuation note while a chained scan runs
   error           TEXT,
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,
