@@ -95,6 +95,10 @@ jobs:
     env:
       STRIX_LLM: ${{ secrets.STRIX_LLM }}
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      # Optional: route the LLM through an OpenAI-compatible endpoint
+      # (e.g. the AgentRouter proxy). Empty when the secret is unset, which
+      # Strix's falsy check treats as "not configured".
+      LLM_API_BASE: ${{ secrets.LLM_API_BASE }}
       PLATFORM_CALLBACK_SECRET: ${{ secrets.PLATFORM_CALLBACK_SECRET }}
       SCAN_MODE: ${{ inputs.scan_mode || 'quick' }}
       BUDGET: ${{ inputs.budget || '10' }}
